@@ -620,6 +620,11 @@ pub fn handleAuthParse(allocator: std.mem.Allocator, request_bytes: []const u8) 
     const prov = obj.get("Provider");
     const raw_json_val = obj.get("RawJSON");
 
+    // If Provider is explicitly given and is NOT gemini-web, return Handled: false immediately.
+    if (prov != null and prov.? == .string and prov.?.string.len > 0 and !std.mem.eql(u8, prov.?.string, "gemini-web")) {
+        return types.wrapOk(allocator, "{\"Handled\":false}");
+    }
+
     var is_gemini_web = false;
     if (prov != null and prov.? == .string and std.mem.eql(u8, prov.?.string, "gemini-web")) {
         is_gemini_web = true;
@@ -646,10 +651,14 @@ pub fn handleAuthParse(allocator: std.mem.Allocator, request_bytes: []const u8) 
     }
 
     // Construct StorageData
-    var st: []const u8 = "";
-    var at: []const u8 = "";
-    var email: []const u8 = "";
-    var project_id: []const u8 = "";
+    var st_buf: ?[]u8 = null;
+    defer if (st_buf) |s| allocator.free(s);
+    var at_buf: ?[]u8 = null;
+    defer if (at_buf) |a| allocator.free(a);
+    var email_buf: ?[]u8 = null;
+    defer if (email_buf) |e| allocator.free(e);
+    var project_id_buf: ?[]u8 = null;
+    defer if (project_id_buf) |p| allocator.free(p);
 
     if (raw_content) |rc| {
         if (std.json.parseFromSlice(std.json.Value, allocator, rc, .{})) |parsed_inner| {
@@ -657,26 +666,26 @@ pub fn handleAuthParse(allocator: std.mem.Allocator, request_bytes: []const u8) 
             if (parsed_inner.value == .object) {
                 const in_obj = parsed_inner.value.object;
                 if (in_obj.get("st")) |v| if (v == .string) {
-                    st = v.string;
+                    st_buf = try allocator.dupe(u8, v.string);
                 };
                 if (in_obj.get("at")) |v| if (v == .string) {
-                    at = v.string;
+                    at_buf = try allocator.dupe(u8, v.string);
                 };
                 if (in_obj.get("email")) |v| if (v == .string) {
-                    email = v.string;
+                    email_buf = try allocator.dupe(u8, v.string);
                 };
                 if (in_obj.get("project_id")) |v| if (v == .string) {
-                    project_id = v.string;
+                    project_id_buf = try allocator.dupe(u8, v.string);
                 };
             }
         } else |_| {}
     }
 
     const storage = types.StorageData{
-        .st = st,
-        .at = at,
-        .email = email,
-        .project_id = project_id,
+        .st = if (st_buf) |s| s else "",
+        .at = if (at_buf) |a| a else "",
+        .email = if (email_buf) |e| e else "",
+        .project_id = if (project_id_buf) |p| p else "",
     };
 
     const auth_data_json = try buildAuthDataJSON(allocator, storage);
@@ -720,7 +729,14 @@ pub fn handleAuthRefresh(allocator: std.mem.Allocator, request_bytes: []const u8
         return types.wrapError(allocator, "invalid_request", "empty st in storage");
     }
 
-    const st = st_val.string;
+    const st = try allocator.dupe(u8, st_val.string);
+    defer allocator.free(st);
+
+    var existing_pid_buf: ?[]u8 = null;
+    defer if (existing_pid_buf) |ep| allocator.free(ep);
+    if (s_obj.get("project_id")) |pid| {
+        if (pid == .string and pid.string.len > 0) existing_pid_buf = try allocator.dupe(u8, pid.string);
+    }
 
     // Refresh access token via /auth/session
     var refreshed_storage = exchangeSessionToken(allocator, st) catch {
@@ -736,11 +752,7 @@ pub fn handleAuthRefresh(allocator: std.mem.Allocator, request_bytes: []const u8
         if (refreshed_storage.project_id.len > 0) allocator.free(refreshed_storage.project_id);
     }
 
-    var existing_pid: []const u8 = "";
-    if (s_obj.get("project_id")) |pid| {
-        if (pid == .string) existing_pid = pid.string;
-    }
-
+    const existing_pid = if (existing_pid_buf) |ep| ep else "";
     const pid = try ensureProject(allocator, st, existing_pid);
     refreshed_storage.project_id = pid;
 

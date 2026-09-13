@@ -17,7 +17,7 @@ const REGISTRATION_RESPONSE =
     \\    "schema_version": 1,
     \\    "metadata": {
     \\      "Name": "gemini-web",
-    \\      "Version": "1.0.1",
+    \\      "Version": "1.0.3",
     \\      "Author": "flow2cpa",
     \\      "Description": "Gemini Web & VideoFX Image/Video Generation Plugin for CLIProxyAPI",
     \\      "GitHubRepository": "https://github.com/flow2cpa/flow2cpa",
@@ -203,4 +203,33 @@ test "main oauth login start and poll" {
 
     const poll_slice = @as([*]const u8, @ptrCast(poll_resp.ptr.?))[0..poll_resp.len];
     try std.testing.expect(std.mem.indexOf(u8, poll_slice, "pending") != null);
+}
+
+test "main auth parse call" {
+    const parse_req =
+        \\{"Provider":"gemini-web","Path":"/data/auth/gemini-web-test.json","FileName":"gemini-web-test.json","RawJSON":"eyJzdCI6InRlc3Rfc3QiLCJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ=="}
+    ;
+    var parse_resp: types.cliproxy_buffer = .{ .ptr = null, .len = 0 };
+    const ret = pluginCall("auth.parse", parse_req.ptr, parse_req.len, &parse_resp);
+    try std.testing.expectEqual(@as(c_int, 0), ret);
+    try std.testing.expect(parse_resp.ptr != null);
+    defer pluginFree(parse_resp.ptr, parse_resp.len);
+
+    const slice = @as([*]const u8, @ptrCast(parse_resp.ptr.?))[0..parse_resp.len];
+    try std.testing.expect(std.mem.indexOf(u8, slice, "\"Handled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slice, "gemini-web-test@example.com") != null);
+}
+
+test "main auth parse other provider call" {
+    const parse_req =
+        \\{"Provider":"claude","Path":"/data/auth/claude.json","FileName":"claude.json","RawJSON":"eyJzdCI6ImFiYyJ9"}
+    ;
+    var parse_resp: types.cliproxy_buffer = .{ .ptr = null, .len = 0 };
+    const ret = pluginCall("auth.parse", parse_req.ptr, parse_req.len, &parse_resp);
+    try std.testing.expectEqual(@as(c_int, 0), ret);
+    try std.testing.expect(parse_resp.ptr != null);
+    defer pluginFree(parse_resp.ptr, parse_resp.len);
+
+    const slice = @as([*]const u8, @ptrCast(parse_resp.ptr.?))[0..parse_resp.len];
+    try std.testing.expect(std.mem.indexOf(u8, slice, "\"Handled\":false") != null);
 }
