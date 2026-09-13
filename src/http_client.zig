@@ -23,10 +23,51 @@ pub const HttpResponse = struct {
     status_code: i64,
     body: []u8,
     raw_response: []u8,
+    headers_json: ?std.json.Value = null,
 
     pub fn deinit(self: *HttpResponse, allocator: std.mem.Allocator) void {
         allocator.free(self.body);
         allocator.free(self.raw_response);
+    }
+
+    /// Helper to find a header value (case-insensitive)
+    pub fn getHeader(self: HttpResponse, name: []const u8) ?[]const u8 {
+        if (self.headers_json == null or self.headers_json.? != .object) return null;
+        var it = self.headers_json.?.object.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
+                if (entry.value_ptr.* == .string) return entry.value_ptr.*.string;
+                if (entry.value_ptr.* == .array and entry.value_ptr.*.array.items.len > 0) {
+                    const first = entry.value_ptr.*.array.items[0];
+                    if (first == .string) return first.string;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Helper to extract all Set-Cookie values
+    pub fn getSetCookies(self: HttpResponse, allocator: std.mem.Allocator) ![][]const u8 {
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer list.deinit(allocator);
+
+        if (self.headers_json == null or self.headers_json.? != .object) return list.toOwnedSlice(allocator);
+
+        var it = self.headers_json.?.object.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "set-cookie")) {
+                if (entry.value_ptr.* == .string) {
+                    try list.append(allocator, entry.value_ptr.*.string);
+                } else if (entry.value_ptr.* == .array) {
+                    for (entry.value_ptr.*.array.items) |item| {
+                        if (item == .string) {
+                            try list.append(allocator, item.string);
+                        }
+                    }
+                }
+            }
+        }
+        return list.toOwnedSlice(allocator);
     }
 };
 
@@ -155,10 +196,18 @@ pub fn hostHttpDo(allocator: std.mem.Allocator, req: HttpRequest) !HttpResponse 
         }
     }
 
+    var headers_val: ?std.json.Value = null;
+    if (res_obj.get("Headers")) |h| {
+        headers_val = h;
+    } else if (res_obj.get("headers")) |h| {
+        headers_val = h;
+    }
+
     return HttpResponse{
         .status_code = status_code,
         .body = body_bytes,
         .raw_response = raw_host_resp,
+        .headers_json = headers_val,
     };
 }
 

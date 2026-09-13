@@ -82,7 +82,7 @@ pub fn parseCookies(allocator: std.mem.Allocator, raw_cookie: []const u8) !Parse
     }
 
     // 2. If not found via JSON, parse as header format: name=value; name2=value2
-    if (st == null and google_cookies_list.items.len == 0) {
+    if (st == null) {
         if (std.mem.indexOfScalar(u8, normalized, '=') != null) {
             var it = std.mem.splitScalar(u8, normalized, ';');
             while (it.next()) |part| {
@@ -132,6 +132,17 @@ fn isGoogleCookieName(name: []const u8) bool {
         "__Secure-3PSID",
         "__Secure-1PAPISID",
         "__Secure-3PAPISID",
+        "__Secure-1PSIDTS",
+        "__Secure-3PSIDTS",
+        "__Secure-1PSIDRTS",
+        "__Secure-3PSIDRTS",
+        "SIDCC",
+        "__Secure-1PSIDCC",
+        "__Secure-3PSIDCC",
+        "NID",
+        "SEARCH_SAMESITE",
+        "GOOGLE_ABUSE_EXEMPTION",
+        "COMPASS",
     };
     for (google_names) |gn| {
         if (std.mem.eql(u8, name, gn)) return true;
@@ -222,6 +233,229 @@ pub fn exchangeSessionToken(allocator: std.mem.Allocator, st: []const u8) !types
     };
 }
 
+/// Helper to merge Set-Cookie header lines into a cookie jar map
+fn mergeSetCookies(map: *std.StringHashMap([]const u8), allocator: std.mem.Allocator, lines: [][]const u8) !void {
+    for (lines) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const first_part = if (std.mem.indexOfScalar(u8, trimmed, ';')) |idx| trimmed[0..idx] else trimmed;
+        if (std.mem.indexOfScalar(u8, first_part, '=')) |eq_idx| {
+            const name = std.mem.trim(u8, first_part[0..eq_idx], " \t\r\n");
+            const val = std.mem.trim(u8, first_part[eq_idx + 1 ..], " \t\r\n");
+            const dup_name = try allocator.dupe(u8, name);
+            const dup_val = try allocator.dupe(u8, val);
+            try map.put(dup_name, dup_val);
+        }
+    }
+}
+
+/// Builds cookie header from StringHashMap
+fn buildCookieHeader(map: std.StringHashMap([]const u8), allocator: std.mem.Allocator) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    var it = map.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!first) try list.appendSlice(allocator, "; ");
+        first = false;
+        try list.appendSlice(allocator, entry.key_ptr.*);
+        try list.append(allocator, '=');
+        try list.appendSlice(allocator, entry.value_ptr.*);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Extracts redirect URL from HTML body (meta refresh or window.location)
+fn extractRedirectFromHtml(html: []const u8) ?[]const u8 {
+    // 1. Check meta refresh
+    const meta_marker = "url=";
+    if (std.mem.indexOf(u8, html, meta_marker)) |idx| {
+        const after = html[idx + meta_marker.len ..];
+        var end: usize = 0;
+        while (end < after.len and after[end] != '"' and after[end] != '\'' and after[end] != '>' and after[end] != ' ' and after[end] != '\n' and after[end] != '\r') {
+            end += 1;
+        }
+        if (end > 0) return after[0..end];
+    }
+    // 2. Check direct callback link
+    const cb_marker = "https://labs.google/fx/api/auth/callback/google";
+    if (std.mem.indexOf(u8, html, cb_marker)) |idx| {
+        const after = html[idx..];
+        var end: usize = 0;
+        while (end < after.len and after[end] != '"' and after[end] != '\'' and after[end] != '<' and after[end] != ' ' and after[end] != '\n' and after[end] != '\r') {
+            end += 1;
+        }
+        if (end > 0) return after[0..end];
+    }
+    return null;
+}
+
+/// Performs protocol login via NextAuth Google OAuth with user Google cookies (corresponds to flow2api protocol_login.py)
+pub fn protocolLoginWithGoogleCookies(allocator: std.mem.Allocator, google_cookies: []const u8) ![]u8 {
+    var labs_cookies = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var it = labs_cookies.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        labs_cookies.deinit();
+    }
+
+    // Step 1: GET /api/auth/csrf
+    var csrf_resp = try http_client.hostHttpDo(allocator, .{
+        .method = "GET",
+        .url = LABS_FX_BASE ++ "/api/auth/csrf",
+        .headers = &.{
+            .{ .name = "User-Agent", .value = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36" },
+            .{ .name = "Accept", .value = "application/json" },
+            .{ .name = "Referer", .value = "https://labs.google/fx" },
+        },
+    });
+    defer csrf_resp.deinit(allocator);
+
+    const csrf_set_cookies = try csrf_resp.getSetCookies(allocator);
+    defer allocator.free(csrf_set_cookies);
+    try mergeSetCookies(&labs_cookies, allocator, csrf_set_cookies);
+
+    if (csrf_resp.status_code != 200 or csrf_resp.body.len == 0) {
+        return error.CsrfFailed;
+    }
+
+    var csrf_parsed = try std.json.parseFromSlice(std.json.Value, allocator, csrf_resp.body, .{});
+    defer csrf_parsed.deinit();
+
+    const csrf_token_val = csrf_parsed.value.object.get("csrfToken") orelse return error.MissingCsrfToken;
+    if (csrf_token_val != .string or csrf_token_val.string.len == 0) return error.MissingCsrfToken;
+    const csrf_token = csrf_token_val.string;
+
+    // Step 2: POST /api/auth/signin/google
+    const labs_cookie_hdr1 = try buildCookieHeader(labs_cookies, allocator);
+    defer allocator.free(labs_cookie_hdr1);
+
+    const signin_body = try std.fmt.allocPrint(allocator, "csrfToken={s}&callbackUrl=https%3A%2F%2Flabs.google%2Ffx&json=true", .{csrf_token});
+    defer allocator.free(signin_body);
+
+    var signin_resp = try http_client.hostHttpDo(allocator, .{
+        .method = "POST",
+        .url = LABS_FX_BASE ++ "/api/auth/signin/google",
+        .headers = &.{
+            .{ .name = "Cookie", .value = labs_cookie_hdr1 },
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "Origin", .value = "https://labs.google" },
+            .{ .name = "Referer", .value = "https://labs.google/fx" },
+            .{ .name = "User-Agent", .value = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36" },
+        },
+        .body = signin_body,
+    });
+    defer signin_resp.deinit(allocator);
+
+    const signin_set_cookies = try signin_resp.getSetCookies(allocator);
+    defer allocator.free(signin_set_cookies);
+    try mergeSetCookies(&labs_cookies, allocator, signin_set_cookies);
+
+    var oauth_url: ?[]const u8 = null;
+    if (signin_resp.body.len > 0) {
+        if (std.json.parseFromSlice(std.json.Value, allocator, signin_resp.body, .{})) |parsed_signin| {
+            defer parsed_signin.deinit();
+            if (parsed_signin.value == .object) {
+                if (parsed_signin.value.object.get("url")) |uv| {
+                    if (uv == .string) oauth_url = uv.string;
+                }
+                if (oauth_url == null) {
+                    if (parsed_signin.value.object.get("redirect")) |rv| {
+                        if (rv == .string) oauth_url = rv.string;
+                    }
+                }
+            }
+        } else |_| {}
+    }
+
+    if (oauth_url == null) {
+        oauth_url = signin_resp.getHeader("Location") orelse return error.NoOAuthRedirect;
+    }
+
+    // Step 3: Follow OAuth redirect with user Google Cookies
+    var current_url: []const u8 = try allocator.dupe(u8, oauth_url.?);
+    defer allocator.free(current_url);
+
+    var callback_url: ?[]u8 = null;
+    defer if (callback_url) |cb| allocator.free(cb);
+
+    for (0..8) |_| {
+        var oauth_resp = try http_client.hostHttpDo(allocator, .{
+            .method = "GET",
+            .url = current_url,
+            .headers = &.{
+                .{ .name = "Cookie", .value = google_cookies },
+                .{ .name = "User-Agent", .value = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36" },
+                .{ .name = "Referer", .value = "https://accounts.google.com/" },
+            },
+        });
+        defer oauth_resp.deinit(allocator);
+
+        if (oauth_resp.getHeader("Location")) |loc| {
+            if (std.mem.indexOf(u8, loc, "labs.google/fx/api/auth/callback/google") != null) {
+                callback_url = try allocator.dupe(u8, loc);
+                break;
+            } else {
+                allocator.free(current_url);
+                current_url = try allocator.dupe(u8, loc);
+                continue;
+            }
+        }
+
+        // Check HTML redirect if status is 200
+        if (oauth_resp.status_code == 200 and oauth_resp.body.len > 0) {
+            if (extractRedirectFromHtml(oauth_resp.body)) |html_loc| {
+                if (std.mem.indexOf(u8, html_loc, "labs.google/fx/api/auth/callback/google") != null) {
+                    callback_url = try allocator.dupe(u8, html_loc);
+                    break;
+                } else {
+                    allocator.free(current_url);
+                    current_url = try allocator.dupe(u8, html_loc);
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    if (callback_url == null) {
+        return error.OAuthCallbackNotFound;
+    }
+
+    // Step 4: Request callback URL with labs_cookies to finalize session
+    const labs_cookie_hdr2 = try buildCookieHeader(labs_cookies, allocator);
+    defer allocator.free(labs_cookie_hdr2);
+
+    var cb_resp = try http_client.hostHttpDo(allocator, .{
+        .method = "GET",
+        .url = callback_url.?,
+        .headers = &.{
+            .{ .name = "Cookie", .value = labs_cookie_hdr2 },
+            .{ .name = "User-Agent", .value = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36" },
+            .{ .name = "Referer", .value = "https://accounts.google.com/" },
+        },
+    });
+    defer cb_resp.deinit(allocator);
+
+    const cb_set_cookies = try cb_resp.getSetCookies(allocator);
+    defer allocator.free(cb_set_cookies);
+    try mergeSetCookies(&labs_cookies, allocator, cb_set_cookies);
+
+    // Look for __Secure-next-auth.session-token in labs_cookies
+    if (labs_cookies.get(SESSION_COOKIE_NAME)) |st| {
+        return try allocator.dupe(u8, st);
+    }
+    if (labs_cookies.get(ALT_SESSION_COOKIE_NAME)) |st| {
+        return try allocator.dupe(u8, st);
+    }
+
+    return error.SessionTokenNotExtracted;
+}
+
 /// Creates a new PINHOLE project for the session if needed
 pub fn ensureProject(allocator: std.mem.Allocator, st: []const u8, existing_project_id: []const u8) ![]u8 {
     if (existing_project_id.len > 0) {
@@ -297,13 +531,22 @@ pub fn importAuthentication(allocator: std.mem.Allocator, raw_cookie: []const u8
     var parsed_cookie = try parseCookies(allocator, raw_cookie);
     defer parsed_cookie.deinit(allocator);
 
-    const st = parsed_cookie.session_token;
-    if (st == null) {
-        // If no session token, but google cookies exist, protocol login could be performed
+    var st_allocated: ?[]u8 = null;
+    defer if (st_allocated) |sa| allocator.free(sa);
+
+    var st: []const u8 = "";
+
+    if (parsed_cookie.session_token) |tok| {
+        st = tok;
+    } else if (parsed_cookie.google_cookie_header) |gh| {
+        // Run Google OAuth protocol login to exchange Google Cookies for NextAuth Session Token!
+        st_allocated = try protocolLoginWithGoogleCookies(allocator, gh);
+        st = st_allocated.?;
+    } else {
         return error.MissingSessionToken;
     }
 
-    var storage = try exchangeSessionToken(allocator, st.?);
+    var storage = try exchangeSessionToken(allocator, st);
     errdefer {
         allocator.free(storage.st);
         allocator.free(storage.at);
@@ -520,6 +763,17 @@ test "cookie parser header format" {
     try std.testing.expectEqualStrings("my_secret_token_123", parsed.session_token.?);
     try std.testing.expect(parsed.google_cookie_header != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.google_cookie_header.?, "SID=sid123") != null);
+}
+
+test "cookie parser user google cookies without session-token" {
+    const allocator = std.testing.allocator;
+    const user_cookie = "SEARCH_SAMESITE=CgQI5aEB; HSID=AsCVmRk7XWaQpGpT2; SSID=A233mD1eNiYr_0oxj; APISID=py2ckyy04s9icxdU/Aj19Q7QvlKPWUTcdz; SAPISID=_Md4L8zR1SBhnYdp/A44Qoq5wOLLldu9-y; SID=g.a000Cgm7YZ3X-EFbtRntPrc5tkxy-Zavbw4UN6m4fzuq38gX0bD0i4AQQXBOKs7PC6UOyuERkAACgYKAbYSARcSFQHGX2Mi3i6QVDzJgqYQCOO9bOf4UBoVAUF8yKoKl6rYPaZqUrAUu4CfXDOu0076;";
+    var parsed = try parseCookies(allocator, user_cookie);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.session_token == null);
+    try std.testing.expect(parsed.google_cookie_header != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.google_cookie_header.?, "SID=g.a000Cgm7") != null);
 }
 
 test "cookie parser raw token format" {
