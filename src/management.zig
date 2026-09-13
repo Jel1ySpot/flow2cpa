@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const auth = @import("auth.zig");
 const http_client = @import("http_client.zig");
+const oauth_login = @import("oauth_login.zig");
 
 pub fn handleManagementRegister(allocator: std.mem.Allocator) ![]u8 {
     const reg_json =
@@ -95,14 +96,9 @@ fn handleApiImportAuth(allocator: std.mem.Allocator, req_obj: std.json.ObjectMap
         const err_json = try std.fmt.bufPrint(&err_buf, "{{\"success\":false,\"error\":\"Failed to import authentication: {s}\"}}", .{@errorName(err)});
         return makeHttpResponse(allocator, 400, err_json, "application/json");
     };
-    defer {
-        allocator.free(storage.st);
-        allocator.free(storage.at);
-        allocator.free(storage.at_expires);
-        allocator.free(storage.email);
-        allocator.free(storage.name);
-        if (storage.project_id.len > 0) allocator.free(storage.project_id);
-    }
+
+    // Store in oauth_login pending slot so if OAuth page poll is active, it completes!
+    oauth_login.pending_imported_storage = storage;
 
     const auth_json = try auth.buildAuthDataJSON(allocator, storage);
     defer allocator.free(auth_json);
@@ -134,7 +130,7 @@ fn handleApiStatus(allocator: std.mem.Allocator) ![]u8 {
         \\{
         \\  "ok": true,
         \\  "plugin": "gemini-web",
-        \\  "version": "1.0.0",
+        \\  "version": "1.0.1",
         \\  "status": "ready",
         \\  "capabilities": ["image_generation", "video_generation", "auth_provider", "management_api", "cli_flags"],
         \\  "default_image_model": "gemini-3.0-pro-image",
@@ -315,7 +311,7 @@ fn handleResourcePage(allocator: std.mem.Allocator) ![]u8 {
         \\    <div class="header">
         \\      <div class="title-group">
         \\        <h1>Gemini Web (Flow2CPA)</h1>
-        \\        <span class="badge">Plugin v1.0.0</span>
+        \\        <span class="badge">Plugin v1.0.1</span>
         \\      </div>
         \\      <div><a href="/v0/management/plugins" style="color: #58a6ff; text-decoration: none; font-size: 14px;">Management Center &rarr;</a></div>
         \\    </div>

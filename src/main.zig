@@ -6,6 +6,7 @@ const models = @import("models.zig");
 const executor = @import("executor.zig");
 const cli = @import("cli.zig");
 const management = @import("management.zig");
+const oauth_login = @import("oauth_login.zig");
 
 const allocator = std.heap.page_allocator;
 
@@ -16,7 +17,7 @@ const REGISTRATION_RESPONSE =
     \\    "schema_version": 1,
     \\    "metadata": {
     \\      "Name": "gemini-web",
-    \\      "Version": "1.0.0",
+    \\      "Version": "1.0.1",
     \\      "Author": "flow2cpa",
     \\      "Description": "Gemini Web & VideoFX Image/Video Generation Plugin for CLIProxyAPI",
     \\      "GitHubRepository": "https://github.com/flow2cpa/flow2cpa",
@@ -45,31 +46,6 @@ const REGISTRATION_RESPONSE =
 ;
 
 const IDENTIFIER_RESPONSE = "{\"ok\":true,\"result\":{\"identifier\":\"gemini-web\"}}";
-
-const LOGIN_START_RESPONSE =
-    \\{
-    \\  "ok": true,
-    \\  "result": {
-    \\    "Provider": "gemini-web",
-    \\    "URL": "https://labs.google/fx",
-    \\    "State": "gemini-web-state",
-    \\    "ExpiresAt": "2030-01-01T00:00:00Z",
-    \\    "Metadata": {
-    \\      "instructions": "Copy Cookie header or session-token from labs.google/fx and import using --gemini-web-auth in CLI or via Management Web UI."
-    \\    }
-    \\  }
-    \\}
-;
-
-const LOGIN_POLL_RESPONSE =
-    \\{
-    \\  "ok": true,
-    \\  "result": {
-    \\    "Status": "pending",
-    \\    "Message": "Waiting for cookie import via --gemini-web-auth or Management UI"
-    \\  }
-    \\}
-;
 
 fn writeResponse(response: [*c]types.cliproxy_buffer, raw_text: []const u8) void {
     if (response == null) return;
@@ -101,9 +77,9 @@ fn handleMethod(method: []const u8, request: []const u8) ![]u8 {
     } else if (std.mem.eql(u8, method, "auth.parse")) {
         return try auth.handleAuthParse(allocator, request);
     } else if (std.mem.eql(u8, method, "auth.login.start")) {
-        return try allocator.dupe(u8, LOGIN_START_RESPONSE);
+        return try oauth_login.handleLoginStart(allocator, request);
     } else if (std.mem.eql(u8, method, "auth.login.poll")) {
-        return try allocator.dupe(u8, LOGIN_POLL_RESPONSE);
+        return try oauth_login.handleLoginPoll(allocator, request);
     } else if (std.mem.eql(u8, method, "auth.refresh")) {
         return try auth.handleAuthRefresh(allocator, request);
     } else if (std.mem.eql(u8, method, "executor.execute")) {
@@ -207,4 +183,24 @@ test "main identifier call" {
 
     const slice = @as([*]const u8, @ptrCast(resp.ptr.?))[0..resp.len];
     try std.testing.expect(std.mem.indexOf(u8, slice, "gemini-web") != null);
+}
+
+test "main oauth login start and poll" {
+    var start_resp: types.cliproxy_buffer = .{ .ptr = null, .len = 0 };
+    const ret1 = pluginCall("auth.login.start", null, 0, &start_resp);
+    try std.testing.expectEqual(@as(c_int, 0), ret1);
+    try std.testing.expect(start_resp.ptr != null);
+    defer pluginFree(start_resp.ptr, start_resp.len);
+
+    const start_slice = @as([*]const u8, @ptrCast(start_resp.ptr.?))[0..start_resp.len];
+    try std.testing.expect(std.mem.indexOf(u8, start_slice, "/v0/resource/plugins/gemini-web/auth") != null);
+
+    var poll_resp: types.cliproxy_buffer = .{ .ptr = null, .len = 0 };
+    const ret2 = pluginCall("auth.login.poll", null, 0, &poll_resp);
+    try std.testing.expectEqual(@as(c_int, 0), ret2);
+    try std.testing.expect(poll_resp.ptr != null);
+    defer pluginFree(poll_resp.ptr, poll_resp.len);
+
+    const poll_slice = @as([*]const u8, @ptrCast(poll_resp.ptr.?))[0..poll_resp.len];
+    try std.testing.expect(std.mem.indexOf(u8, poll_slice, "pending") != null);
 }
