@@ -1,0 +1,123 @@
+# Build and Release CI for Flow2CPA
+name: Build & Release
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-windows
+            target: x86_64-windows
+            goos: windows
+            goarch: amd64
+            artifact_name: gemini-web.dll
+            asset_dir: zig-out/bin
+          - name: x86_64-linux
+            target: x86_64-linux
+            goos: linux
+            goarch: amd64
+            artifact_name: libgemini-web.so
+            rename_to: gemini-web.so
+            asset_dir: zig-out/lib
+          - name: aarch64-linux
+            target: aarch64-linux
+            goos: linux
+            goarch: arm64
+            artifact_name: libgemini-web.so
+            rename_to: gemini-web.so
+            asset_dir: zig-out/lib
+          - name: x86_64-macos
+            target: x86_64-macos
+            goos: darwin
+            goarch: amd64
+            artifact_name: libgemini-web.dylib
+            rename_to: gemini-web.dylib
+            asset_dir: zig-out/lib
+          - name: aarch64-macos
+            target: aarch64-macos
+            goos: darwin
+            goarch: arm64
+            artifact_name: libgemini-web.dylib
+            rename_to: gemini-web.dylib
+            asset_dir: zig-out/lib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Run tests
+        if: matrix.target == 'x86_64-linux'
+        run: zig test src/main.zig
+
+      - name: Build shared library
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Prepare distribution package (CPA Plugin Standard)
+        run: |
+          mkdir -p dist
+          SRC_FILE="${{ matrix.asset_dir }}/${{ matrix.artifact_name }}"
+          DEST_NAME="${{ matrix.rename_to || matrix.artifact_name }}"
+          cp "$SRC_FILE" "dist/$DEST_NAME"
+          cd dist
+          zip -9 "../gemini-web_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "$DEST_NAME"
+          cd ..
+          sha256sum "gemini-web_${{ matrix.goos }}_${{ matrix.goarch }}.zip" > "gemini-web_${{ matrix.goos }}_${{ matrix.goarch }}.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-web-${{ matrix.name }}
+          path: |
+            dist/*
+            gemini-web_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+  release:
+    name: Release Assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Aggregate zip files and generate checksums.txt
+        run: |
+          mkdir -p release-assets
+          find all-artifacts -name "*.zip" -exec cp {} release-assets/ \;
+          cd release-assets
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*.zip
+            release-assets/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false

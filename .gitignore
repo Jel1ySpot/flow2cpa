@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+*.lib
+*.pdb
+*.exp
+dist/
+*.zip
+*.sha256
+release-assets/
