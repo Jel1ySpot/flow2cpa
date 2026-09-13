@@ -59,10 +59,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+      - name: Install Zig 0.16.0
+        run: |
+          ZIG_URL="https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          curl -sSL "$ZIG_URL" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          mv zig-*-0.16.0 /opt/zig
+          echo "/opt/zig" >> $GITHUB_PATH
+
+      - name: Verify Zig installation
+        run: zig version
 
       - name: Run tests
         if: matrix.target == 'x86_64-linux'
